@@ -7,7 +7,7 @@
 Class ucAniGifEx
 Option Explicit
 /********************************************************************************
-    ucAniGifEx v1.0
+    ucAniGifEx v1.0.1
     by Jon Johnson, ported from Windows SDK WicAnimatedGif example, with
          corrections, additional features, and conversion to control.
     (c) 2025. Distributed under the MIT License.
@@ -62,6 +62,12 @@ Option Explicit
       does not seem to be impacting the control. A bug report has been filed.
       
     Change log: 
+      (09 Apr 2025, v1.0.1)
+          -To match modern browsers, gifs without looping info will only play once.
+          -Bug fix: Loop control override not properly implemented.
+          -Bug fix: Missing ByVals in loop metadata lookup caused all gifs to loop 
+                infinitely; could possibly cause crash.
+            
       (08 Apr 2025, v1.0) - Initial release.
       
     Thanks
@@ -335,13 +341,13 @@ End Function
 
 Private Function EndOfAnimation() As Boolean
     Dim bRet As Boolean
-    bRet = mHasLoop And IsLastFrame()
     If nLcOvr = UCGFEX_LC_USEDEFAULT Then
-        Return bRet And (mLoopNumber = mTotalLoopCount + 1)
+        bRet = mHasLoop AndAlso IsLastFrame()
+        Return bRet AndAlso (mLoopNumber = mTotalLoopCount + 1)
     ElseIf nLcOvr = UCGFEX_LC_FORCEINFINITE Then
-        Return bRet
+        Return False
     Else
-        Return bRet And (mLoopNumber = 2)
+        Return IsLastFrame()
     End If
 End Function
 
@@ -420,7 +426,9 @@ Private Function ComposeNextFrame() As Long
             End If
         Wend
         
-        If IsLastFrame() Then RaiseEvent LoopEnd(mLoopNumber)
+        If IsLastFrame() Then
+            RaiseEvent LoopEnd(mLoopNumber)
+        End If
         
         If (EndOfAnimation() = False) And (mcFrames > 1) And (bStopFlag = False) Then
             If (bPaused = False) Then
@@ -675,10 +683,11 @@ Private Function GetGlobalMetadata() As Long
         ' // contains "NETSCAPE2.0" And "ANIMEXTS1.0", which indicates the gif animation
         ' // has looping information associated With it.
         ' // 
-        ' // If we fail to get the looping information, Loop the animation infinitely.
+        ' // If we fail to get the looping information play once (SDK is inf but follow modern browsers)
         If (SUCCEEDED(pMetadataQueryReader.GetMetadataByName(StrPtr("/appext/application"), propValue))) Then
 
             If VarTypeEx(propValue) = (VT_UI1 Or VT_VECTOR) Then
+              '  Debug.Print "cElems=" & CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).cElems
                 If CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).cElems = 11 Then  '// Length of the application block
                     If (CompareMemory(ByVal CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, ByVal StrPtr(UtfToANSI("NETSCAPE2.0")), CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).cElems) = 0) Or _
                     (CompareMemory(ByVal CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, ByVal StrPtr(UtfToANSI("ANIMEXTS1.0")), CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).cElems) = 0) Then
@@ -698,12 +707,12 @@ Private Function GetGlobalMetadata() As Long
             ' //  byte 4: set to zero
                 If CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).cElems >= 4 Then
                     Dim t1 As Byte, t2 As Byte
-                    CopyMemory t1, CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 1
-                    CopyMemory t2, PointerAdd(CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 1), 1
+                    CopyMemory t1, ByVal CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 1
+                    CopyMemory t2, ByVal PointerAdd(CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 1), 1
                     If (t1 > 0) And (t2 = 1) Then
                         Dim t3 As Byte, t4 As Byte
-                        CopyMemory t3, PointerAdd(CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 2), 1
-                        CopyMemory t4, PointerAdd(CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 3), 1
+                        CopyMemory t3, ByVal PointerAdd(CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 2), 1
+                        CopyMemory t4, ByVal PointerAdd(CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 3), 1
                         mTotalLoopCount = MAKEWORD(t3, t4)
                         If mTotalLoopCount Then
                             mHasLoop = True
@@ -711,6 +720,9 @@ Private Function GetGlobalMetadata() As Long
                     End If
                 End If
             End If
+        Else
+            mHasLoop = True
+            mTotalLoopCount = 0
         End If
     End If
     PropVariantClear(propValue)
