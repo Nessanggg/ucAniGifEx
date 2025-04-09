@@ -1,0 +1,1999 @@
+[Description("ucAniGifEx Animated Gif Control v1.0")]
+[FormDesignerId("2AC43A6D-210E-4973-A545-D35D383E2084")]
+[ClassId("F5130EB4-C963-4B8A-8A4F-7972701B2936")]
+[InterfaceId("E2B98344-1A48-4653-8F7F-33EEDB48CC24")]
+[EventInterfaceId("9F7B29F0-0707-4577-93C2-87980E742B38")]
+[COMControl]
+Class ucAniGifEx
+Option Explicit
+/********************************************************************************
+    ucAniGifEx v1.0
+    by Jon Johnson, ported from Windows SDK WicAnimatedGif example, with
+         corrections, additional features, and conversion to control.
+    (c) 2025. Distributed under the MIT License.
+    
+    This is a followup to my ucAniGif control, which while it had very 
+    simple code, there were a number of flaws. Some were mistakes that could
+    be fixed, but others were limitations of the underlying GdiPlus code or
+    impractical to fix in the shell interface (I already was resorting to
+    patching assembly instructions in memory to fix the slow playback bug!).
+    
+    Many gifs did not play right, or at all. And very limited extras.
+    
+    While the code here is significantly more complex, this control supports 
+    every gif I've found, but it's just as simple to use from the outside 
+    while adding some basic enhancements.
+        
+    Features:
+      -Multiple options to display a gif: 
+         StartupFile property - Loads and plays a gif file from disk on load
+         DisplayGifFromFile - Loads and plays a gif file from disk on call
+         DisplayGifFromResource - Loads and plays a gif file from the project
+              resources. Specify the ID and group; LoadResData is used.
+         DisplayGifFromMemory - Play direct from a byte array containing a 
+              complete gif file.
+      
+      -Paused property can stop/resume playback, StopPlayback command
+      
+      -Will be transparent to the control BackColor; it's recommended you set
+       this before playing, i.e. ucAniGifEx1.BackColor = Me.BackColor, then play.
+      
+      -Gif is scaled to the control size by default.
+      
+      -PreserveAspectRatio option, with centering in the frame
+      
+      -SizeToFit - Resizes the control to the gif size. Scaling is disabled.
+      
+      -LoopControl - Override the gifs default to force infinite loops or only
+          play once.
+      
+      -LoopEnd, PlaybackEnd, and FrameStep events. Note: FrameStep is disabled
+          by default, to receive it, set EnablePerFrameEvents to True.
+      
+      -AdvanceByOneFrame - If paused, advance by a single frame without resuming.
+      
+      -FrameCount, FrameIndex, ImageWidth, ImageHeight properties.
+    
+    Requirements:
+      Windows 7 or newer
+      
+    Known issues:
+      twinBASIC currently displays a continuable exception error in the IDE. This
+      does not seem to be impacting the control. A bug report has been filed.
+      
+    Change log: 
+      (08 Apr 2025, v1.0) - Initial release.
+      
+    Thanks
+      Special thanks to bahbahbah (whose code I wound up using), jpbro, and 
+      The trick for helping me sort through some scaling issues.
+      And wqweto for helping me out with some C++ issues to get the original
+      SDK example working so I could compare.
+*********************************************************************************/
+Public Event LoopEnd(ByVal totalPlayed As Long)
+Public Event PlaybackEnd()
+Public Event FrameStep(ByVal nCurrentFrame As Long)
+Private bEnableEvnts As Boolean 'Per frame events (just frame step for now)
+                                'can interfere with performance
+Public Enum UCGifEx_LoopControl
+    UCGFEX_LC_USEDEFAULT 'Use the GIFs internal setting
+    UCGFEX_LC_FORCEINFINITE
+    UCGFEX_LC_FORCEONE
+End Enum
+Private nLcOvr As UCGifEx_LoopControl
+
+Private mWicFact As WICImagingFactory
+Private mDecoder As IWICBitmapDecoder
+Private mFileStream As IStream
+Private maFile() As Byte
+Private mFile As String
+Private mFileStartup As String
+Private mD2DFact As ID2D1Factory
+Private mhwndRT As ID2D1HwndRenderTarget
+Private mFrameComposeRT As ID2D1BitmapRenderTarget
+Private mRawFrame As ID2D1Bitmap
+Private mSavedFrame As ID2D1Bitmap
+Private mClrBk As D2D1_COLOR_F
+Private mframePosition As D2D1_RECT_F
+Private mhwnd As LongPtr
+Private mhwndPar As LongPtr
+Private mNextFrameIdx As Long
+Private mFrameDisposal As DISPOSAL_METHODS
+Private mLoopNumber As Long
+Private mTotalLoopCount As Long
+Private mHasLoop As Boolean
+Private mcFrames As Long
+Private mFrameDelay As Long
+Private mcxGifImage As Long
+Private mcyGifImage As Long
+Private mcxGifImagePixel As Long
+Private mcyGifImagePixel As Long
+Private mActive As Boolean
+
+Private Const DEFAULT_DPI As Single = 96
+Private Const DELAY_TIMER_ID As Long = 1
+Private Const IDR_WICANIMATEDGIF = 103
+Private Const IDM_EXIT  = 105
+Private Const IDM_FILE  = 106
+Private bSizeToFit As Boolean
+Private bPreserveAR As Boolean
+Private bStopFlag As Boolean
+Private bPaused As Boolean
+Private bkUc As OLE_COLOR
+
+Private Enum DISPOSAL_METHODS
+    DM_UNDEFINED = 0
+    DM_NONE = 1
+    DM_BACKGROUND = 2
+    DM_PREVIOUS = 3
+End Enum
+
+Private Const WndClass As String = "WICANIMATEDGIF"
+
+#Region "Control events"
+Private Sub UserControl_InitProperties() Handles UserControl.InitProperties
+    bPreserveAR = True
+End Sub
+
+Private Sub UserControl_ReadProperties(PropBag As PropertyBag) Handles UserControl.ReadProperties
+    bPreserveAR = PropBag.ReadProperty("PreserveAspectRatio", True)
+    bSizeToFit = PropBag.ReadProperty("SizeToFit", False)
+    mFileStartup = PropBag.ReadProperty("StartupFile", "")
+    nLcOvr = PropBag.ReadProperty("LoopControl", 0)
+    bEnableEvnts = PropBag.ReadProperty("EnablePerFrameEvents", False)
+    Me.BackColor = PropBag.ReadProperty("BackColor", vbWhite)
+    bkUc = Me.BackColor
+End Sub
+
+Private Sub UserControl_WriteProperties(PropBag As PropertyBag) Handles UserControl.WriteProperties
+    PropBag.WriteProperty("PreserveAspectRatio", bPreserveAR, True)
+    PropBag.WriteProperty("SizeToFit", bSizeToFit, False)
+    PropBag.WriteProperty("StartupFile", mFileStartup, "")
+    PropBag.WriteProperty("LoopControl", nLcOvr, 0)
+    PropBag.WriteProperty("EnablePerFrameEvents", bEnableEvnts, False)
+    PropBag.WriteProperty "BackColor", Me.BackColor, vbWhite
+End Sub
+Private Sub UserControl_Show() Handles UserControl.Show
+    If Ambient.UserMode Then
+        Dim hr As Long = Initialize(App.hInstance)
+        If SUCCEEDED(hr) Then
+            If PathFileExists(mFileStartup) Then
+                DisplayGifFromFile(mFileStartup)
+            Else
+                Debug.Print "Initialize succeeded, waiting for gif"
+           End If
+        Else
+            Debug.Print "Initialize error 0x" & Hex$(hr) & ", " & GetSystemErrorString(hr)
+        End If
+    End If
+End Sub
+
+Private Sub UserControl_Terminate() Handles UserControl.Terminate
+    If mhwnd Then DestroyWindow mhwnd
+    
+End Sub
+
+Private Sub UserControl_Resize() Handles UserControl.Resize
+    If bSizeToFit = False Then
+        Dim rc As RECT
+        GetClientRect UserControl.hWnd, rc
+        MoveWindow(mhwnd, _
+                    0, _
+                    0, _
+                    RectWidth(rc), _
+                    RectHeight(rc), _
+                    CTRUE)
+        OnResize(rc.Right, rc.Bottom)
+   End If
+End Sub
+#End Region
+
+#Region "Public methods"
+Public Property Get BackColor() As OLE_COLOR
+    Return UserControl.BackColor
+End Property
+Public Property Let BackColor(ByVal clr As OLE_COLOR)
+    bkUc = clr
+    UserControl.BackColor = bkUc
+    If mhwnd Then
+        Dim hDC As LongPtr = GetDC(mhwnd)
+        SetBkColor hDC, OleTranslateColor(bkUc, 0)
+        ReleaseDC mhwnd, hDC
+    End If
+    PropertyChanged("BackColor")
+End Property
+Public Property Get StartupFile() As String
+    Return mFileStartup
+End Property
+[Description("Set a gif to play on startup.")]
+Public Property Let StartupFile(ByVal sFile As String)
+    mFileStartup = sFile
+End Property
+Public Property Get LoopControl() As UCGifEx_LoopControl
+    Return nLcOvr
+End Property
+[Description("Allows you to override the default looping settings for a gif.")]
+Public Property Let LoopControl(ByVal eValue As UCGifEx_LoopControl)
+    nLcOvr = eValue
+End Property
+Public Property Get SizeToFit() As Boolean
+    Return bSizeToFit
+End Property
+[Description("Resizes the UserControl to the GIF size. If the UserControl is resize after loading a gif, the gif will not be resized.")]
+Public Property Let SizeToFit(ByVal bValue As Boolean)
+    bSizeToFit = bValue
+End Property
+Public Property Get PreserveAspectRatio() As Boolean
+    Return bPreserveAR
+End Property
+[Description("Preserves the aspect ratio when scaling the gif.")]
+Public Property Let PreserveAspectRatio(ByVal bValue As Boolean)
+    bPreserveAR = bValue
+End Property
+Public Property Get EnablePerFrameEvents() As Boolean
+    Return bEnableEvnts
+End Property
+[Description("Raise events that occur once per frame; off by default to protect performance..")]
+Public Property Let EnablePerFrameEvents(ByVal bValue As Boolean)
+    bEnableEvnts = bValue
+End Property
+
+Public Property Get Paused() As Boolean
+    Return bPaused
+End Property
+[Hidden]
+Public Property Let Paused(ByVal bValue As Boolean)
+    bPaused = bValue
+    If (bPaused = False) AndAlso (mActive = True) Then
+        SetTimer(mhwnd, DELAY_TIMER_ID, mFrameDelay, 0)
+    End If
+End Property
+
+'Read-only properties:
+Public Property Get FrameCount() As Long: Return mcFrames: End Property
+Public Property Get FrameIndex() As Long: Return mNextFrameIdx: End Property
+Public Property Get ImageWidth() As Long: Return mcxGifImage: End Property
+Public Property Get ImageHeight() As Long: Return mcyGifImage: End Property
+
+
+Public Sub AdvanceByOneFrame()
+    If bPaused Then
+        SetTimer(mhwnd, DELAY_TIMER_ID, mFrameDelay, 0)
+    End If
+End Sub
+Public Sub StopPlayback()
+    bStopFlag = True
+End Sub
+Public Function DisplayGifFromResource(ByVal id As String, ByVal group As String) As Long
+    Dim b() As Byte
+    b = LoadResData(id, group)
+    Return DisplayGifFromMemory(b)
+End Function
+Public Function DisplayGifFromMemory(baFile() As Byte) As Long
+    If mFileStream IsNot Nothing Then Set mFileStream = Nothing
+    maFile = baFile
+    CreateStreamOnHGlobal(VarPtr(maFile(0)), CFALSE, mFileStream)
+    Return DisplayGifInternal(True)
+End Function
+Public Function DisplayGifFromFile(ByVal sFile As String) As Long
+    mFile = sFile
+    Return DisplayGifInternal(False)
+End Function
+#End Region
+
+
+#Region "Private methods"
+Private Function Initialize(ByVal hInstance As LongPtr) As Long
+    Dim wcex As WNDCLASSEX
+    wcex.cbSize = LenB(Of WNDCLASSEX)
+    wcex.style = CS_HREDRAW Or CS_VREDRAW
+    wcex.lpfnWndProc = AddressOf s_WndProc
+    wcex.cbClsExtra = 0
+    wcex.cbWndExtra = LenB(Of LongPtr)
+    wcex.hInstance = hInstance
+    wcex.hCursor = LoadCursor(0, IDC_ARROW)
+    wcex.hbrBackground = 0
+    wcex.lpszClassName = StrPtr(WndClass)
+    
+    Dim hr As Long = If(RegisterClassEx(wcex) = 0, E_FAIL, S_OK)
+    If SUCCEEDED(hr) Then
+        hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, IID_ID2D1Factory, ByVal 0, mD2DFact)
+    End If
+    If SUCCEEDED(hr) Then
+        Set mWicFact = New WICImagingFactory
+        hr = Err.LastHresult
+    End If
+    If SUCCEEDED(hr) Then
+        mhwnd = CreateWindow("WICANIMATEDGIF", _
+                                "WIC Animated Gif Sample", _
+                                WS_VISIBLE Or WS_CHILD, _
+                                0, _
+                                0, _
+                                UserControl.ScaleWidth, _
+                                UserControl.ScaleHeight, _
+                                UserControl.hWnd, _
+                                0, _
+                                hInstance, _
+                                ObjPtr(Me))
+        hr = Err.LastDllError
+        hr = If(mhwnd = 0, E_FAIL, S_OK)
+    
+    End If
+    
+    If SUCCEEDED(hr) Then
+        If FAILED(hr) Then
+            DestroyWindow mhwnd
+        End If
+    End If
+    
+    Return hr
+End Function
+
+Private Function IsLastFrame() As Boolean
+    Return (mNextFrameIdx = 0)
+End Function
+
+Private Function EndOfAnimation() As Boolean
+    Dim bRet As Boolean
+    bRet = mHasLoop And IsLastFrame()
+    If nLcOvr = UCGFEX_LC_USEDEFAULT Then
+        Return bRet And (mLoopNumber = mTotalLoopCount + 1)
+    ElseIf nLcOvr = UCGFEX_LC_FORCEINFINITE Then
+        Return bRet
+    Else
+        Return bRet And (mLoopNumber = 2)
+    End If
+End Function
+
+Private Function DisplayGifInternal(ByVal bUseStream As Boolean) As Long
+    On Error Resume Next
+    Dim hr As Long
+    Dim rcClient As RECT
+    Dim rcWindow As RECT
+    mNextFrameIdx = 0
+    mFrameDisposal = DM_NONE ' No previous frame, use disposal none
+    mLoopNumber = 0
+    mHasLoop = False
+    bStopFlag = False
+    bPaused = False
+    Set mSavedFrame = Nothing
+    If bUseStream Then
+        Set mDecoder = mWicFact.CreateDecoderFromStream(mFileStream, vbNullPtr, _ 
+                                            WICDecodeMetadataCacheOnLoad)
+    Else
+        If mFileStream IsNot Nothing Then Set mFileStream = Nothing
+        Set mDecoder = mWicFact.CreateDecoderFromFilename(StrPtr(mFile), vbNullPtr, _
+                                            GENERIC_READ, WICDecodeMetadataCacheOnLoad)
+        hr = Err.LastHresult
+    End If
+    If SUCCEEDED(hr) Then
+        hr = GetGlobalMetadata()
+    End If
+    If SUCCEEDED(hr) Then
+        rcClient.Right = mcxGifImagePixel
+        rcClient.Bottom = mcyGifImagePixel
+        If bSizeToFit Then
+            UserControl.Width = mcxGifImagePixel * Screen.TwipsPerPixelX
+            UserControl.Height = mcyGifImagePixel * Screen.TwipsPerPixelY
+        End If
+        'Skip AdjustWindowRect since we're now an internal borderless child window
+    End If
+    If SUCCEEDED(hr) Then
+        If GetWindowRect(mhwnd, rcWindow) = 0 Then
+            hr = HRESULT_FROM_WIN32(Err.LastDllError)
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+        
+        'Skip the SDK's MoveWindow here to start at the size of the UserControl
+        '(mhwnd was created with its cx/cy)
+        
+        hr = CreateDeviceResources()
+    
+        If SUCCEEDED(hr) Then
+            If mcFrames > 0 Then
+                mActive = True
+                hr = ComposeNextFrame()
+                InvalidateRect(mhwnd, vbNullPtr, CFALSE)
+            End If
+        End If
+    End If
+    Return hr
+End Function
+
+Private Function ComposeNextFrame() As Long
+    On Error Resume Next
+    Dim hr As Long
+    If (mhwndRT IsNot Nothing) And (mFrameComposeRT IsNot Nothing) Then
+        KillTimer(mhwnd, DELAY_TIMER_ID)
+        hr = DisposeCurrentFrame()
+        If SUCCEEDED(hr) Then
+            hr = OverlayNextFrame()
+            If bEnableEvnts Then RaiseEvent FrameStep(mNextFrameIdx)
+        End If
+    
+        While SUCCEEDED(hr) And (mFrameDelay = 0) And (IsLastFrame() = False)
+            hr = DisposeCurrentFrame()
+            If (SUCCEEDED(hr)) Then
+                hr = OverlayNextFrame()
+                If bEnableEvnts Then RaiseEvent FrameStep(mNextFrameIdx)
+            End If
+        Wend
+        
+        If IsLastFrame() Then RaiseEvent LoopEnd(mLoopNumber)
+        
+        If (EndOfAnimation() = False) And (mcFrames > 1) And (bStopFlag = False) Then
+            If (bPaused = False) Then
+                SetTimer(mhwnd, DELAY_TIMER_ID, mFrameDelay, 0)
+                'don't want to raise PlaybackEnd if paused 
+            End If
+        Else
+            mActive = False
+            If mcFrames > 1 Then
+                RaiseEvent PlaybackEnd()
+            End If
+        End If
+
+    End If
+
+    Return hr
+End Function
+
+Private Function DisposeCurrentFrame() As Long
+    On Error Resume Next
+    Dim hr As Long
+    Select Case mFrameDisposal
+        Case DM_UNDEFINED, DM_NONE
+            ' We simply draw on the previous frames. Do nothing here.
+        Case DM_BACKGROUND
+            ' // Dispose background
+            ' // Clear the area covered by the current raw frame with background color
+            hr = ClearCurrentFrameArea()
+        Case DM_PREVIOUS
+            ' // Dispose previous
+            ' // We restore the previous composed frame first
+            hr = RestoreSavedFrame()
+        Case Else
+            hr = E_FAIL
+    End Select
+    Return hr
+End Function
+
+Private Function OverlayNextFrame() As Long
+    On Error Resume Next
+    Dim hr As Long
+    hr = GetRawFrame(mNextFrameIdx)
+    If SUCCEEDED(hr) Then
+        '    // For disposal 3 method, we would want to save a copy of the current
+        '    // composed frame
+        If (mFrameDisposal = DM_PREVIOUS) Then
+            hr = SaveComposedFrame()
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+        mFrameComposeRT.BeginDraw()
+        If mNextFrameIdx = 0 Then
+            mFrameComposeRT.Clear(mClrBk)
+            mLoopNumber += 1
+        End If
+        mFrameComposeRT.DrawBitmap(mRawFrame, mframePosition, 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, vbNullPtr)
+        mFrameComposeRT.EndDraw(ByVal 0, ByVal 0)
+        hr = Err.LastHresult
+    End If
+    If SUCCEEDED(hr) Then
+        mNextFrameIdx += 1
+        mNextFrameIdx = mNextFrameIdx Mod mcFrames
+    End If
+    Return hr
+End Function
+
+Private Function SaveComposedFrame() As Long
+    On Error Resume Next
+    Dim hr As Long
+    Dim pFrameToBeSaved As ID2D1Bitmap
+    Set pFrameToBeSaved = mFrameComposeRT.GetBitmap()
+    hr = Err.LastHresult
+    If SUCCEEDED(hr) Then
+        If mSavedFrame Is Nothing Then
+            Dim bitmapSize As D2D1_SIZE_U
+            Dim bitmapProp As D2D1_BITMAP_PROPERTIES
+            pFrameToBeSaved.GetDpi(bitmapProp.DpiX, bitmapProp.DpiY)
+            bitmapProp.PixelFormat = pFrameToBeSaved.GetPixelFormat()
+        
+            Set mSavedFrame = mFrameComposeRT.CreateBitmap(SizeToLongLong(bitmapSize.width, bitmapSize.Height), _
+                                                                    ByVal 0, 0, bitmapProp)
+            hr = Err.LastHresult
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+        mSavedFrame.CopyFromBitmap(vbNullPtr, pFrameToBeSaved, vbNullPtr)
+    End If
+    Set pFrameToBeSaved = Nothing
+    Return Err.LastHresult
+End Function
+
+Private Function RestoreSavedFrame() As Long
+    On Error Resume Next
+    Dim hr As Long
+    Dim pFrameToCopyTo As ID2D1Bitmap
+    hr = If(mSavedFrame IsNot Nothing, S_OK, E_FAIL)
+    If SUCCEEDED(hr) Then
+        Set pFrameToCopyTo = mFrameComposeRT.GetBitmap()
+        hr = Err.LastHresult
+    End If
+    If SUCCEEDED(hr) Then
+        pFrameToCopyTo.CopyFromBitmap(vbNullPtr, mSavedFrame, vbNullPtr)
+    End If
+    Return Err.LastHresult
+End Function
+
+Private Function RecoverDeviceResources() As Long
+    On Error Resume Next
+    Dim hr As Long
+    Set mhwndRT = Nothing
+    Set mFrameComposeRT = Nothing
+    Set mSavedFrame = Nothing
+
+    mNextFrameIdx = 0
+    mFrameDisposal = DM_NONE ' No previous frames. Use disposal none.
+    mLoopNumber = 0
+
+    hr = CreateDeviceResources()
+    If SUCCEEDED(hr) Then
+        If mcFrames > 0 Then
+            hr = ComposeNextFrame()
+            InvalidateRect(mhwnd, vbNullPtr, CFALSE)
+        End If
+    End If
+
+    Return hr
+End Function
+
+Private Function ClearCurrentFrameArea() As Long
+    On Error Resume Next
+    mFrameComposeRT.BeginDraw()
+    mFrameComposeRT.PushAxisAlignedClip(mframePosition, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE)
+    mFrameComposeRT.Clear(mClrBk)
+    mFrameComposeRT.PopAxisAlignedClip()
+    mFrameComposeRT.EndDraw(ByVal 0, ByVal 0)
+    Return Err.LastHresult
+End Function
+
+Private Function CreateDeviceResources() As Long
+    On Error Resume Next
+    Dim hr As Long
+    Dim rcClient As RECT
+    If GetClientRect(mhwnd, rcClient) = 0 Then
+        hr = HRESULT_FROM_WIN32(Err.LastDllError)
+    End If
+    If SUCCEEDED(hr) Then
+        If mhwndRT Is Nothing Then
+            Dim renderTargetProperties As D2D1_RENDER_TARGET_PROPERTIES
+            renderTargetProperties = D2D1.RenderTargetProperties()
+            renderTargetProperties.DpiX = DEFAULT_DPI
+            renderTargetProperties.DpiY = DEFAULT_DPI
+        
+            Dim hwndRenderTragetproperties As D2D1_HWND_RENDER_TARGET_PROPERTIES
+            With hwndRenderTragetproperties
+                .hwnd = mhwnd
+                .pixelSize = D2D1.SizeU(RectWidth(rcClient), RectHeight(rcClient))
+            End With
+        
+            Set mhwndRT = mD2DFact.CreateHwndRenderTarget(renderTargetProperties, _
+                                                hwndRenderTragetproperties)
+            hr = Err.LastHresult
+        Else
+            ' // We already have a hwnd render target, resize it to the window size
+            Dim size As D2D1_SIZE_U
+            size.width = RectWidth(rcClient)
+            size.Height = RectHeight(rcClient)
+            mhwndRT.Resize(size)
+            hr = Err.LastHresult
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+        Set mFrameComposeRT = Nothing
+        Set mFrameComposeRT = mhwndRT.CreateCompatibleRenderTarget(D2D1.SizeF(mcxGifImage, mcyGifImage), _
+                                        vbNullPtr, vbNullPtr, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE)
+    
+        hr = Err.LastHresult
+    End If
+    Return hr
+End Function
+
+Private Function GetGlobalMetadata() As Long
+    On Error Resume Next
+    Dim propValue As Variant
+    PropVariantInit(propValue)
+    Dim pMetadataQueryReader As IWICMetadataQueryReader
+
+    Dim hr As Long = mDecoder.GetFrameCount(mcFrames)
+    If SUCCEEDED(hr) Then
+        hr = mDecoder.GetMetadataQueryReader(pMetadataQueryReader)
+        If SUCCEEDED(hr) Then
+            If FAILED(GetBackgroundColor(pMetadataQueryReader)) Then
+                ' Default to transparent if failed to get the color
+                mClrBk = D2D1.ColorF(0, 0)
+            End If
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+    hr = pMetadataQueryReader.GetMetadataByName(StrPtr("/logscrdesc/Width"), propValue)
+    If SUCCEEDED(hr) Then
+        hr = If(VarTypeEx(propValue) = VT_UI2, S_OK, E_FAIL)
+        If SUCCEEDED(hr) Then
+            CopyMemory mcxGifImage, ByVal PointerAdd(VarPtr(propValue), 8), 2
+        End If
+        PropVariantClear(propValue)
+    End If
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pMetadataQueryReader.GetMetadataByName(StrPtr("/logscrdesc/Height"), propValue)
+        If SUCCEEDED(hr) Then
+            hr = If(VarTypeEx(propValue) = VT_UI2, S_OK, E_FAIL)
+            If SUCCEEDED(hr) Then
+                CopyMemory mcyGifImage, ByVal PointerAdd(VarPtr(propValue), 8), 2
+            End If
+            PropVariantClear(propValue)
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pMetadataQueryReader.GetMetadataByName(StrPtr("/logscrdesc/PixelAspectRatio"), propValue)
+        If SUCCEEDED(hr) Then
+            hr = If(VarTypeEx(propValue) = VT_UI1, S_OK, E_FAIL)
+            If SUCCEEDED(hr) Then
+                Dim uPixelAspRatio As Long
+                CopyMemory uPixelAspRatio, ByVal PointerAdd(VarPtr(propValue), 8), 1
+                If uPixelAspRatio Then
+                ' // Need to calculate the ratio. The value in uPixelAspRatio 
+                ' // allows specifying widest pixel 4:1 to the tallest pixel of 
+                ' // 1:4 in increments of 1/64th
+                    Dim pixelAspRatio As Single = (uPixelAspRatio + 15.0!) / 64.0!
+
+                    ' // Calculate the image width And height in pixel based On the
+                    ' // pixel aspect ratio. Only shrink the image.
+                    If (pixelAspRatio > 1.0!) Then
+                        mcxGifImagePixel = mcxGifImage
+                        mcyGifImagePixel = CLng(mcyGifImage \ pixelAspRatio)
+                    Else
+                        mcxGifImagePixel = CLng(mcxGifImage * pixelAspRatio)
+                        mcyGifImagePixel = mcyGifImage
+                    End If
+                Else
+                    ' // The value Is 0, so its ratio Is 1
+                    mcxGifImagePixel = mcxGifImage
+                    mcyGifImagePixel = mcyGifImage
+                End If
+                PropVariantClear(propValue)
+            End If
+        End If
+    End If
+                    
+    'Get looping info
+    If SUCCEEDED(hr) Then
+        ' // First check to see if the application block in the Application Extension
+        ' // contains "NETSCAPE2.0" And "ANIMEXTS1.0", which indicates the gif animation
+        ' // has looping information associated With it.
+        ' // 
+        ' // If we fail to get the looping information, Loop the animation infinitely.
+        If (SUCCEEDED(pMetadataQueryReader.GetMetadataByName(StrPtr("/appext/application"), propValue))) Then
+
+            If VarTypeEx(propValue) = (VT_UI1 Or VT_VECTOR) Then
+                If CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).cElems = 11 Then  '// Length of the application block
+                    If (CompareMemory(ByVal CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, ByVal StrPtr(UtfToANSI("NETSCAPE2.0")), CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).cElems) = 0) Or _
+                    (CompareMemory(ByVal CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, ByVal StrPtr(UtfToANSI("ANIMEXTS1.0")), CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).cElems) = 0) Then
+                
+                        PropVariantClear(propValue)
+                    End If
+                End If
+            End If
+            hr = pMetadataQueryReader.GetMetadataByName(StrPtr("/appext/data"), propValue)
+        
+            If (SUCCEEDED(hr)) Then
+            ' //  The data is in the following format:
+            ' //  byte 0: extsize (must be > 1)
+            ' //  byte 1: loopType (1 == animated gif)
+            ' //  byte 2: loop count (least significant byte)
+            ' //  byte 3: loop count (most significant byte)
+            ' //  byte 4: set to zero
+                If CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).cElems >= 4 Then
+                    Dim t1 As Byte, t2 As Byte
+                    CopyMemory t1, CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 1
+                    CopyMemory t2, PointerAdd(CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 1), 1
+                    If (t1 > 0) And (t2 = 1) Then
+                        Dim t3 As Byte, t4 As Byte
+                        CopyMemory t3, PointerAdd(CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 2), 1
+                        CopyMemory t4, PointerAdd(CType(Of CAUB)(PointerAdd(VarPtr(propValue), 8)).pElems, 3), 1
+                        mTotalLoopCount = MAKEWORD(t3, t4)
+                        If mTotalLoopCount Then
+                            mHasLoop = True
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+    PropVariantClear(propValue)
+    Set pMetadataQueryReader = Nothing
+    Return hr
+End Function
+
+Private Function GetRawFrame(ByVal uFrameIndex As Long) As Long
+    On Error Resume Next
+    Dim hr As Long
+    Dim pConverter As IWICFormatConverter
+    Dim pWicFrame As IWICBitmapFrameDecode
+    Dim pFrameMetadataQueryReader As IWICMetadataQueryReader
+    Dim propValue As Variant
+    PropVariantInit(propValue)
+
+    Set pWicFrame = mDecoder.GetFrame(uFrameIndex)
+    hr = Err.LastHresult
+    If SUCCEEDED(hr) Then
+        Set pConverter = mWicFact.CreateFormatConverter()
+        hr = Err.LastHresult
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pConverter.Initialize(pWicFrame, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, Nothing, 0, WICBitmapPaletteTypeCustom)
+    End If
+    If SUCCEEDED(hr) Then
+        Set mRawFrame = Nothing
+        Set mRawFrame = mhwndRT.CreateBitmapFromWicBitmap(pConverter, vbNullPtr)
+        hr = Err.LastHresult
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pWicFrame.GetMetadataQueryReader(pFrameMetadataQueryReader)
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pFrameMetadataQueryReader.GetMetadataByName(StrPtr("/imgdesc/Left"), propValue)
+        If SUCCEEDED(hr) Then
+            hr = If(VarTypeEx(propValue) = VT_UI2, S_OK, E_FAIL)
+            If SUCCEEDED(hr) Then
+                Dim tmp As Long
+                CopyMemory tmp, ByVal PointerAdd(VarPtr(propValue), 8), 2
+                mframePosition.Left = tmp
+            End If
+            PropVariantClear(propValue)
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pFrameMetadataQueryReader.GetMetadataByName(StrPtr("/imgdesc/Top"), propValue)
+        If SUCCEEDED(hr) Then
+            hr = If(VarTypeEx(propValue) = VT_UI2, S_OK, E_FAIL)
+            If SUCCEEDED(hr) Then
+                CopyMemory tmp, ByVal PointerAdd(VarPtr(propValue), 8), 2
+                mframePosition.Top = tmp
+            End If
+            PropVariantClear(propValue)
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pFrameMetadataQueryReader.GetMetadataByName(StrPtr("/imgdesc/Width"), propValue)
+        If SUCCEEDED(hr) Then
+            hr = If(VarTypeEx(propValue) = VT_UI2, S_OK, E_FAIL)
+            If SUCCEEDED(hr) Then
+                CopyMemory tmp, ByVal PointerAdd(VarPtr(propValue), 8), 2
+                mframePosition.Right = tmp + mframePosition.Left
+            End If
+            PropVariantClear(propValue)
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pFrameMetadataQueryReader.GetMetadataByName(StrPtr("/imgdesc/Height"), propValue)
+        If SUCCEEDED(hr) Then
+            hr = If(VarTypeEx(propValue) = VT_UI2, S_OK, E_FAIL)
+            If SUCCEEDED(hr) Then
+                CopyMemory tmp, ByVal PointerAdd(VarPtr(propValue), 8), 2
+                mframePosition.Bottom = tmp + mframePosition.Top
+            End If
+            PropVariantClear(propValue)
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pFrameMetadataQueryReader.GetMetadataByName(StrPtr("/grctlext/Delay"), propValue)
+        If SUCCEEDED(hr) Then
+            hr = If(VarTypeEx(propValue) = VT_UI2, S_OK, E_FAIL)
+            If SUCCEEDED(hr) Then
+                CopyMemory tmp, ByVal PointerAdd(VarPtr(propValue), 8), 2
+                mFrameDelay = tmp * 10
+            End If
+            PropVariantClear(propValue)
+        Else
+            mFrameDelay = 0
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+        'We're going to do things different than the SDK example here, because the SDK example
+        'says If < 90 then = 90, which seems an awful lot like the Netscape bug from the 90s
+        'they account for in IShellImageData/InternetExplorer. Since plenty of modern gifs have
+        'frame delays below 90ms deliberately that are required for smooth playback, we'll go
+        'ahead and risk some parts of 90s-era gifs not playing quite right and only impose an
+        'artificial delay if it's 0 or 1.
+        If mFrameDelay <= 10 Then mFrameDelay = 90
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pFrameMetadataQueryReader.GetMetadataByName(StrPtr("/grctlext/Disposal"), propValue)
+        If SUCCEEDED(hr) Then
+            hr = If(VarTypeEx(propValue) = VT_UI1, S_OK, E_FAIL)
+            If SUCCEEDED(hr) Then
+                CopyMemory tmp, ByVal PointerAdd(VarPtr(propValue), 8), 1
+                mFrameDisposal = tmp
+            End If
+            PropVariantClear(propValue)
+        Else
+            mFrameDisposal = DM_UNDEFINED
+        End If
+    End If
+
+    PropVariantClear(propValue)
+    Set pConverter = Nothing
+    Set pWicFrame = Nothing
+    Set pFrameMetadataQueryReader = Nothing
+
+    Return hr
+End Function
+
+Private Function GetBackgroundColor(ByVal pMetadataQueryReader As IWICMetadataQueryReader) As Long
+    On Error Resume Next
+    Dim dwBGColor As Long
+    Dim backgroundIndex As Byte
+    Dim rgColors(255) As Long ' WicColor
+    Dim cColorsCopied As Long
+    Dim propVariant As Variant
+    PropVariantInit(propVariant)
+    Dim pWicPalette As IWICPalette
+
+    Dim hr As Long = pMetadataQueryReader.GetMetadataByName(StrPtr("/logscrdesc/GlobalColorTableFlag"), propVariant)
+    If SUCCEEDED(hr) Then
+        If VarTypeEx(propVariant) = VT_BOOL Then
+            Dim boolVal As Long
+            CopyMemory boolVal, ByVal PointerAdd(VarPtr(propVariant), 8), 4
+            If boolVal = 0 Then
+                hr = E_FAIL
+            End If
+        Else
+            hr = E_FAIL
+        End If
+        PropVariantClear(propVariant)
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pMetadataQueryReader.GetMetadataByName(StrPtr("/logscrdesc/BackgroundColorIndex"), propVariant)
+        If SUCCEEDED(hr) Then
+            If VarTypeEx(propVariant) <> VT_UI1 Then
+                hr = E_FAIL
+            Else
+                hr = S_OK
+                backgroundIndex = propVariant
+            End If
+            PropVariantClear(propVariant)
+        End If
+    End If
+    If SUCCEEDED(hr) Then
+        hr = mWicFact.CreatePalette(pWicPalette)
+    End If
+    If SUCCEEDED(hr) Then
+        hr = mDecoder.CopyPalette(pWicPalette)
+    End If
+    If SUCCEEDED(hr) Then
+        hr = pWicPalette.GetColors(UBound(rgColors) + 1, rgColors(0), cColorsCopied)
+    End If
+    If SUCCEEDED(hr) Then
+        hr = IIf(backgroundIndex >= cColorsCopied, E_FAIL, S_OK)
+    End If
+    If SUCCEEDED(hr) Then
+        dwBGColor = rgColors(backgroundIndex)
+        Dim alpha As Single
+        alpha = (dwBGColor >> 24) / 255
+        hr = pMetadataQueryReader.GetMetadataByName(StrPtr("/grctlext/TransparentColorIndex"), propVariant)
+        If SUCCEEDED(hr) Then
+            If VarTypeEx(propVariant) <> VT_UI1 Then
+                hr = E_FAIL
+            Else
+                hr = S_OK
+                If CByte(propVariant) = 1 Then alpha = 0
+            End If
+            PropVariantClear(propVariant)
+        End If
+        mClrBk = D2D1.ColorF(dwBGColor, alpha)
+    End If
+
+    Return hr
+End Function
+
+Private Function CalculateDrawRectangle(drawRect As D2D1_RECT_F) As Long
+    On Error Resume Next
+    Dim hr As Long
+    Dim rcClient As RECT
+    If GetClientRect(mhwnd, rcClient) = 0 Then
+        hr = HRESULT_FROM_WIN32(Err.LastDllError)
+    End If
+
+    If SUCCEEDED(hr) Then
+        If bPreserveAR = False Then
+            drawRect.Left = 0
+            drawRect.Top = 0
+            drawRect.Right = rcClient.Right
+            drawRect.Bottom = rcClient.Bottom
+        Else
+            Dim aspectRatio As Single = mcxGifImagePixel / mcyGifImagePixel
+        
+            Dim newWidth As Single, newHeight As Single
+            If (rcClient.Right > mcxGifImage) And (rcClient.Bottom > mcxGifImage) Then
+                'image must be expanded 
+                Dim clientWidth As Single
+                Dim clientHeight As Single
+                clientWidth = rcClient.Right - rcClient.Left
+                clientHeight = rcClient.Bottom - rcClient.Top
+
+                Dim scaleX As Single, scaleY As Single, sScale As Single
+                scaleX = clientWidth / mcxGifImagePixel
+                scaleY = clientHeight / mcyGifImagePixel
+                sScale = scaleX
+                If scaleY < scaleX Then sScale = scaleY
+    
+                newWidth = mcxGifImagePixel * sScale
+                newHeight = mcyGifImagePixel * sScale
+
+                drawRect.Left = (clientWidth - newWidth) / 2
+                drawRect.Top = (clientHeight - newHeight) / 2
+                drawRect.Right = drawRect.Left + newWidth
+                drawRect.Bottom = drawRect.Top + newHeight
+            Else
+                'original handling that works for size <= gif size
+                drawRect.Left = (rcClient.Right - mcxGifImagePixel) / 2
+                drawRect.Top = (rcClient.Bottom - mcyGifImagePixel) / 2
+                drawRect.Right = drawRect.Left + mcxGifImagePixel
+                drawRect.Bottom = drawRect.Top + mcyGifImagePixel
+            
+
+                If (drawRect.Left < 0) Then
+                    newWidth = (rcClient.Right)
+                    newHeight = newWidth / aspectRatio
+                    drawRect.Left = 0
+                    drawRect.Top = (rcClient.Bottom - newHeight) / 2
+                    drawRect.Right = newWidth
+                    drawRect.Bottom = drawRect.Top + newHeight
+                End If
+                If (drawRect.Top < 0) Then
+                    newHeight = (rcClient.Bottom)
+                    newWidth = newHeight * aspectRatio
+                    drawRect.Left = (rcClient.Right - newWidth) / 2
+                    drawRect.Top = 0
+                    drawRect.Right = drawRect.Left + newWidth
+                    drawRect.Bottom = newHeight
+                End If
+            End If
+        End If
+     
+    End If
+
+    Return hr
+End Function
+
+Private Function OnRender() As Long
+    On Error Resume Next
+    ' Debug.Print "OnRender Nextframe=" & mNextFrameIdx & ", total=" & mcFrames & ", dly=" & mFrameDelay
+    Dim hr As Long
+    Dim pFrameToRender As ID2D1Bitmap
+    If (mhwndRT IsNot Nothing) And (mFrameComposeRT IsNot Nothing) Then
+        'Only render when the window is not occludedD2D1_COLORS.WhiteUserControl.BackColorD2D1_COLORS.LightGray
+        If (mhwndRT.CheckWindowState() And D2D1_WINDOW_STATE_OCCLUDED) = 0 Then
+            Dim drawRect As D2D1_RECT_F
+            hr = CalculateDrawRectangle(drawRect)
+            If SUCCEEDED(hr) Then
+                Set pFrameToRender = mFrameComposeRT.GetBitmap()
+                hr = Err.LastHresult
+            End If
+            If SUCCEEDED(hr) Then
+                Dim clrb As Long
+                OleTranslateColor UserControl.BackColor, 0, clrb
+                mhwndRT.BeginDraw()
+                mhwndRT.Clear(D2D1.ColorF(clrb))
+                mhwndRT.DrawBitmap(pFrameToRender, drawRect, 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, vbNullPtr)
+                mhwndRT.EndDraw(ByVal 0, ByVal 0)
+                hr = Err.LastHresult
+            End If
+        End If
+        
+    End If
+    Set pFrameToRender = Nothing
+    Return hr
+End Function
+
+Private Function OnResize(ByVal uWidth As Long, ByVal uHeight As Long) As Long
+    On Error Resume Next
+    Dim hr As Long
+    If mhwndRT IsNot Nothing Then
+        Dim size As D2D1_SIZE_U
+        size.width = uWidth
+        size.Height = uHeight
+        mhwndRT.Resize(size)
+        hr = Err.LastHresult
+    End If
+    Return hr
+End Function
+
+Private Function RectWidth(rc As RECT) As Long
+    Return rc.Right - rc.Left
+End Function
+Private Function RectHeight(rc As RECT) As Long
+    Return rc.Bottom - rc.Top
+End Function
+
+Private Function s_WndProc(ByVal phWnd As LongPtr, ByVal uMsg As Long, ByVal wParam As LongPtr, ByVal lParam As LongPtr) As LongPtr
+    Dim pThis As ucAniGifEx
+    Dim lRet As LongPtr
+    Dim pTmp As LongPtr
+    If uMsg = WM_NCCREATE Then
+        pTmp = CType(Of CREATESTRUCT)(lParam).lpCreateParams
+        SetWindowLongPtr phWnd, GWLP_USERDATA, pTmp
+        lRet = DefWindowProc(phWnd, uMsg, wParam, lParam)
+    Else
+        pTmp = GetWindowLongPtr(phWnd, GWLP_USERDATA)
+        If pTmp Then
+            CopyMemory pThis, pTmp, LenB(Of LongPtr)
+            lRet = pThis.ucWndProc(phWnd, uMsg, wParam, lParam)
+            CopyMemory pThis, 0, LenB(Of LongPtr)
+        Else
+            lRet = DefWindowProc(phWnd, uMsg, wParam, lParam)
+        End If
+    End If
+    Return lRet
+End Function
+
+Public Function ucWndProc(ByVal phWnd As LongPtr, ByVal uMsg As Long, ByVal wParam As LongPtr, ByVal lParam As LongPtr) As LongPtr
+    Dim hr As Long
+    Select Case uMsg
+        Case WM_PAINT
+            hr = OnRender()
+            ValidateRect(phWnd, vbNullPtr)
+            
+        Case WM_TIMER
+            hr = ComposeNextFrame()
+            hr = InvalidateRect(phWnd, vbNullPtr, CFALSE)
+            
+        Case WM_SIZE
+            Dim uWidth As Long = LOWORD(lParam)
+            Dim uHeight As Long = HIWORD(lParam)
+            hr = OnResize(uWidth, uHeight)
+    
+        Case WM_DISPLAYCHANGE
+            InvalidateRect(phWnd, vbNullPtr, CFALSE)
+         
+        Case Else
+            Return DefWindowProc(phWnd, uMsg, wParam, lParam)
+    End Select
+
+    If hr = D2DERR_RECREATE_TARGET Then
+        hr = RecoverDeviceResources()
+        If FAILED(hr) Then
+            MsgBox "Device loss recovery failed.", vbCritical Or vbOKOnly, App.Title
+        End If
+    End If
+    
+    Return 0
+End Function
+#End Region
+End Class
+
+[PredeclaredId(True)]
+Private Class D2D1
+    'Direct2D helpers class by The trick, adjusted 
+    Private Const FloatMax   As Single = 3.402823466E+38
+    Public Function Point2F( _
+                    ByVal fX As Single, _
+                    ByVal fY As Single) As D2D1_POINT_2F
+            
+        Point2F.x = fX
+        Point2F.y = fY
+
+    End Function
+    Public Function Point2U( _
+                    ByVal lX As Long, _
+                    ByVal lY As Long) As D2D1_POINT_2U
+            
+        Point2U.x = lX
+        Point2U.y = lY
+
+    End Function
+    Public Function RectF( _
+                    Optional ByVal fLeft As Single, _
+                    Optional ByVal fTop As Single, _
+                    Optional ByVal fRight As Single, _
+                    Optional ByVal fBottom As Single) As D2D1_RECT_F
+
+        With RectF
+
+        .Left = fLeft
+        .Right = fRight
+        .Top = fTop
+        .Bottom = fBottom
+
+        End With
+
+    End Function
+    Public Function RectF_InfiniteRect() As D2D1_RECT_F
+
+        With RectF_InfiniteRect
+
+        .Left = -FloatMax
+        .Right = FloatMax
+        .Top = -FloatMax
+        .Bottom = FloatMax
+
+        End With
+
+    End Function
+
+    Public Function RectU( _
+                    Optional ByVal lLeft As Long, _
+                    Optional ByVal lTop As Long, _
+                    Optional ByVal lRight As Long, _
+                    Optional ByVal lBottom As Long) As D2D1_RECT_U
+
+        With RectU
+
+        .Left = lLeft
+        .Right = lRight
+        .Top = lTop
+        .Bottom = lBottom
+
+        End With
+
+    End Function
+
+    Public Function ArcSegment( _
+                    ByRef tPoint As D2D1_POINT_2F, _
+                    ByRef tSize As D2D1_SIZE_F, _
+                    ByVal fRotationAngle As Single, _
+                    ByVal eSweepDirection As D2D1_SWEEP_DIRECTION, _
+                    ByVal eArcSize As D2D1_ARC_SIZE) As D2D1_ARC_SEGMENT
+
+        With ArcSegment
+
+        .POINT = tPoint
+        .SIZE = tSize
+        .rotationAngle = fRotationAngle
+        .sweepDirection = eSweepDirection
+        .arcSize = eArcSize
+
+        End With
+
+    End Function
+
+    Public Function BezierSegment( _
+                    ByRef tPoint1 As D2D1_POINT_2F, _
+                    ByRef tPoint2 As D2D1_POINT_2F, _
+                    ByRef tPoint3 As D2D1_POINT_2F) As D2D1_BEZIER_SEGMENT
+
+        With BezierSegment
+
+        .point1 = tPoint1
+        .point2 = tPoint2
+        .point3 = tPoint3
+
+        End With
+
+    End Function
+
+    Public Function Ellipse( _
+                    ByRef tCenter As D2D1_POINT_2F, _
+                    ByVal fRadiusX As Single, _
+                    ByVal fRadiusY As Single) As D2D1_ELLIPSE
+
+        With Ellipse
+
+        .POINT = tCenter
+        .radiusX = fRadiusX
+        .radiusY = fRadiusY
+
+        End With
+
+    End Function
+
+    Public Function RoundedRect( _
+                    ByRef tRect As D2D1_RECT_F, _
+                    ByVal fRadiusX As Single, _
+                    ByVal fRadiusY As Single) As D2D1_ROUNDED_RECT
+
+        With RoundedRect
+
+        .RECT = tRect
+        .radiusX = fRadiusX
+        .radiusY = fRadiusY
+
+        End With
+
+    End Function
+
+    Public Function BrushProperties( _
+                    ByVal fOpacity As Single, _
+                    ByRef tTransform As D2D1_MATRIX_3X2_F) As D2D1_BRUSH_PROPERTIES
+
+        With BrushProperties
+
+        .opacity = fOpacity
+        .transform = tTransform
+
+        End With
+
+    End Function
+
+    Public Function GradientStop( _
+                    ByVal fPosition As Single, _
+                    ByRef tColor As D2D1_COLOR_F) As D2D1_GRADIENT_STOP
+
+        With GradientStop
+
+        .position = fPosition
+        .color = tColor
+
+        End With
+
+    End Function
+
+    Public Function QuadraticBezierSegment( _
+                    ByRef tPoint1 As D2D1_POINT_2F, _
+                    ByRef tPoint2 As D2D1_POINT_2F) As D2D1_QUADRATIC_BEZIER_SEGMENT
+
+        With QuadraticBezierSegment
+
+        .point1 = tPoint1
+        .point2 = tPoint2
+
+        End With
+
+    End Function
+    
+    Public Function ColorF( _
+                    ByVal eColor As D2D1_COLORS, _
+                    Optional ByVal fAlpha As Single = 1!) As D2D1_COLOR_F
+        Dim bR As Byte
+        Dim bB As Byte
+        Dim bG As Byte
+
+        'bB = eColor And &HFF
+        bB = (eColor \ &H10000) And &HFF
+        bG = (eColor \ &H100) And &HFF
+        'bR = (eColor \ &H10000) And &HFF
+        bR = eColor And &HFF
+        With ColorF
+
+        .r = bR / 255!
+        .g = bG / 255!
+        .b = bB / 255!
+        .a = fAlpha
+
+        End With
+
+    End Function
+
+    Public Function ColorF( _
+                    ByVal fR As Single, _
+                    ByVal fG As Single, _
+                    ByVal fB As Single, _
+                    Optional ByVal fAlpha As Single = 1!) As D2D1_COLOR_F
+
+        With ColorF
+
+        .r = fR
+        .g = fG
+        .b = fB
+        .a = fAlpha
+
+        End With
+
+    End Function
+
+    Public Function Matrix3x2F( _
+                    ByVal f_11 As Single, _
+                    ByVal f_12 As Single, _
+                    ByVal f_21 As Single, _
+                    ByVal f_22 As Single, _
+                    ByVal f_31 As Single, _
+                    ByVal f_32 As Single) As D2D1_MATRIX_3X2_F
+
+        With Matrix3x2F
+
+        .m_11 = f_11
+        .m_12 = f_12
+        .m_21 = f_21
+        .m_22 = f_22
+        .m_31 = f_31
+        .m_32 = f_32
+
+        End With
+
+    End Function
+
+    Public Function Matrix3x2F_Identity() As D2D1_MATRIX_3X2_F
+
+        With Matrix3x2F_Identity
+
+        .m_11 = 1
+        .m_22 = 1
+
+        End With
+
+    End Function
+
+    Public Function Matrix3x2F_Translation( _
+                    ByRef tSize As D2D1_SIZE_F) As D2D1_MATRIX_3X2_F
+
+        With Matrix3x2F_Translation
+
+        .m_11 = 1!: .m_12 = 0!
+        .m_21 = 0!: .m_22 = 1!
+        .m_31 = tSize.width: .m_32 = tSize.Height
+
+        End With
+
+    End Function
+
+    Public Function Matrix3x2F_Translation2( _
+                    ByVal fWidth As Single, _
+                    ByVal fHeight As Single) As D2D1_MATRIX_3X2_F
+
+        With Matrix3x2F_Translation2
+
+        .m_11 = 1!: .m_12 = 0!
+        .m_21 = 0!: .m_22 = 1!
+        .m_31 = fWidth: .m_32 = fHeight
+
+        End With
+
+    End Function
+
+    Public Function Matrix3x2F_Scale( _
+                    ByRef tSize As D2D1_SIZE_F, _
+                    ByRef tCenter As D2D1_POINT_2F) As D2D1_MATRIX_3X2_F
+
+        With Matrix3x2F_Scale
+
+        .m_11 = tSize.width: .m_12 = 0!
+        .m_21 = 0!: .m_22 = tSize.Height
+        .m_31 = tCenter.x - tSize.width * tCenter.x
+        .m_32 = tCenter.y - tSize.Height * tCenter.y
+
+        End With
+
+    End Function
+
+    Public Function Matrix3x2F_Scale2( _
+                    ByVal fWidth As Single, _
+                    ByVal fHeight As Single, _
+                    ByRef tCenter As D2D1_POINT_2F) As D2D1_MATRIX_3X2_F
+
+        With Matrix3x2F_Scale2
+
+        .m_11 = fWidth: .m_12 = 0!
+        .m_21 = 0!: .m_22 = fHeight
+        .m_31 = tCenter.x - fWidth * tCenter.x
+        .m_32 = tCenter.y - fHeight * tCenter.y
+
+        End With
+
+    End Function
+
+    Public Function Matrix3x2F_Rotation( _
+                    ByVal fAngle As Single, _
+                    ByRef tCenter As D2D1_POINT_2F) As D2D1_MATRIX_3X2_F
+        D2D1MakeRotateMatrix fAngle, PointFToLongLong(tCenter.x, tCenter.y), Matrix3x2F_Rotation
+    End Function
+
+    Public Function Matrix3x2F_Rotation2( _
+                    ByVal fAngle As Single, _
+                    ByVal fCenterX As Single, _
+                    ByVal fCentery As Single) As D2D1_MATRIX_3X2_F
+        D2D1MakeRotateMatrix fAngle, PointFToLongLong(fCenterX, fCentery), Matrix3x2F_Rotation2
+    End Function
+
+    Public Function Matrix3x2F_Skew( _
+                    ByVal fAngleX As Single, _
+                    ByVal fAngleY As Single, _
+                    ByRef tCenter As D2D1_POINT_2F) As D2D1_MATRIX_3X2_F
+        D2D1MakeSkewMatrix fAngleX, fAngleY, PointFToLongLong(tCenter.x, tCenter.y), Matrix3x2F_Skew
+    End Function
+
+    Public Function Matrix3x2F_Determinant( _
+                    ByRef tMtx As D2D1_MATRIX_3X2_F) As Single
+        Matrix3x2F_Determinant = (tMtx.m_11 * tMtx.m_22) - (tMtx.m_12 * tMtx.m_21)
+    End Function
+
+    Public Function Matrix3x2F_IsInvertible( _
+                    ByRef tMtx As D2D1_MATRIX_3X2_F) As Boolean
+        Matrix3x2F_IsInvertible = D2D1IsMatrixInvertible(tMtx)
+    End Function
+
+    Public Function Matrix3x2F_Invert( _
+                    ByRef tMtx As D2D1_MATRIX_3X2_F) As Boolean
+        Matrix3x2F_Invert = D2D1InvertMatrix(tMtx)
+    End Function
+
+    Public Function Matrix3x2F_IsIdentity( _
+                    ByRef tMtx As D2D1_MATRIX_3X2_F) As Boolean
+        Matrix3x2F_IsIdentity = (tMtx.m_11 = 1!) And (tMtx.m_12 = 0!) And _
+                                (tMtx.m_21 = 0!) And (tMtx.m_22 = 1!) And _
+                                (tMtx.m_31 = 0!) And (tMtx.m_32 = 0!)
+    End Function
+
+    Public Function Matrix3x2F_SetProduct( _
+                    ByRef tMtx1 As D2D1_MATRIX_3X2_F, _
+                    ByRef tMtx2 As D2D1_MATRIX_3X2_F) As D2D1_MATRIX_3X2_F
+            
+        With Matrix3x2F_SetProduct
+
+        .m_11 = tMtx1.m_11 * tMtx2.m_11 + tMtx1.m_12 * tMtx2.m_21
+        .m_12 = tMtx1.m_11 * tMtx2.m_12 + tMtx1.m_12 * tMtx2.m_22
+        .m_21 = tMtx1.m_21 * tMtx2.m_11 + tMtx1.m_22 * tMtx2.m_21
+        .m_22 = tMtx1.m_21 * tMtx2.m_12 + tMtx1.m_22 * tMtx2.m_22
+        .m_31 = tMtx1.m_31 * tMtx2.m_11 + tMtx1.m_32 * tMtx2.m_21 + tMtx2.m_31
+        .m_32 = tMtx1.m_31 * tMtx2.m_12 + tMtx1.m_32 * tMtx2.m_22 + tMtx2.m_32
+
+        End With
+
+    End Function
+
+    Public Function Matrix3x2F_TransformPoint( _
+                    ByRef tMtx As D2D1_MATRIX_3X2_F, _
+                    ByRef tPoint As D2D1_POINT_2F) As D2D1_POINT_2F
+
+        With Matrix3x2F_TransformPoint
+
+        .x = tPoint.x * tMtx.m_11 + tPoint.y * tMtx.m_21 + tMtx.m_31
+        .y = tPoint.x * tMtx.m_12 + tPoint.y * tMtx.m_22 + tMtx.m_32
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x3F( _
+                    ByVal f_11 As Single, _
+                    ByVal f_12 As Single, _
+                    ByVal f_13 As Single, _
+                    ByVal f_21 As Single, _
+                    ByVal f_22 As Single, _
+                    ByVal f_23 As Single, _
+                    ByVal f_31 As Single, _
+                    ByVal f_32 As Single, _
+                    ByVal f_33 As Single, _
+                    ByVal f_41 As Single, _
+                    ByVal f_42 As Single, _
+                    ByVal f_43 As Single) As D2D1_MATRIX_4X3_F
+
+        With Matrix4x3F
+
+        .m_11 = f_11
+        .m_12 = f_12
+        .m_13 = f_13
+        .m_21 = f_21
+        .m_22 = f_22
+        .m_23 = f_23
+        .m_31 = f_31
+        .m_32 = f_32
+        .m_33 = f_33
+        .m_41 = f_41
+        .m_42 = f_42
+        .m_43 = f_43
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x3F_Identity() As D2D1_MATRIX_4X3_F
+
+        With Matrix4x3F_Identity
+
+        .m_11 = 1!
+        .m_22 = 1!
+        .m_33 = 1!
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F( _
+                    ByVal f_11 As Single, _
+                    ByVal f_12 As Single, _
+                    ByVal f_13 As Single, _
+                    ByVal f_14 As Single, _
+                    ByVal f_21 As Single, _
+                    ByVal f_22 As Single, _
+                    ByVal f_23 As Single, _
+                    ByVal f_24 As Single, _
+                    ByVal f_31 As Single, _
+                    ByVal f_32 As Single, _
+                    ByVal f_33 As Single, _
+                    ByVal f_34 As Single, _
+                    ByVal f_41 As Single, _
+                    ByVal f_42 As Single, _
+                    ByVal f_43 As Single, _
+                    ByVal f_44 As Single) As D2D1_MATRIX_4X4_F
+
+        With Matrix4x4F
+
+        .m_11 = f_11
+        .m_12 = f_12
+        .m_13 = f_13
+        .m_14 = f_14
+        .m_21 = f_21
+        .m_22 = f_22
+        .m_23 = f_23
+        .m_24 = f_24
+        .m_31 = f_31
+        .m_32 = f_32
+        .m_33 = f_33
+        .m_34 = f_34
+        .m_41 = f_41
+        .m_42 = f_42
+        .m_43 = f_43
+        .m_44 = f_44
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_Identity() As D2D1_MATRIX_4X4_F
+
+        With Matrix4x4F_Identity
+
+        .m_11 = 1!
+        .m_22 = 1!
+        .m_33 = 1!
+        .m_44 = 1!
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_Translation( _
+                    ByVal fX As Single, _
+                    ByVal fY As Single, _
+                    ByVal fZ As Single) As D2D1_MATRIX_4X4_F
+
+        With Matrix4x4F_Translation
+
+        .m_11 = 1!
+        .m_22 = 1!
+        .m_33 = 1!
+        .m_44 = 1!
+        .m_41 = fX
+        .m_42 = fY
+        .m_43 = fZ
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_Scale( _
+                    ByVal fX As Single, _
+                    ByVal fY As Single, _
+                    ByVal fZ As Single) As D2D1_MATRIX_4X4_F
+
+        With Matrix4x4F_Scale
+
+        .m_11 = fX
+        .m_22 = fY
+        .m_33 = fZ
+        .m_44 = 1!
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_RotationX( _
+                    ByVal fDegreeX As Single) As D2D1_MATRIX_4X4_F
+        Dim fAngleInRadian  As Single
+        Dim fSin            As Single
+        Dim fCos            As Single
+
+        fAngleInRadian = fDegreeX * (3.141593! / 180!)
+
+        D2D1SinCos fAngleInRadian, fSin, fCos
+
+        With Matrix4x4F_RotationX
+
+        .m_11 = 1
+        .m_22 = fCos
+        .m_33 = fCos
+        .m_23 = fSin
+        .m_32 = -fSin
+        .m_44 = 1!
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_RotationY( _
+                    ByVal fDegreeY As Single) As D2D1_MATRIX_4X4_F
+        Dim fAngleInRadian  As Single
+        Dim fSin            As Single
+        Dim fCos            As Single
+
+        fAngleInRadian = fDegreeY * (3.141593! / 180!)
+
+        D2D1SinCos fAngleInRadian, fSin, fCos
+
+        With Matrix4x4F_RotationY
+
+        .m_11 = fCos
+        .m_13 = -fSin
+        .m_22 = 1!
+        .m_31 = fSin
+        .m_33 = fCos
+        .m_44 = 1!
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_RotationZ( _
+                    ByVal fDegreeZ As Single) As D2D1_MATRIX_4X4_F
+        Dim fAngleInRadian  As Single
+        Dim fSin            As Single
+        Dim fCos            As Single
+
+        fAngleInRadian = fDegreeZ * (3.141593! / 180!)
+
+        D2D1SinCos fAngleInRadian, fSin, fCos
+
+        With Matrix4x4F_RotationZ
+
+        .m_11 = fCos
+        .m_12 = fSin
+        .m_21 = -fSin
+        .m_22 = fCos
+        .m_33 = 1!
+        .m_44 = 1!
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_RotationArbitraryAxis( _
+                    ByVal fX As Single, _
+                    ByVal fY As Single, _
+                    ByVal fZ As Single, _
+                    ByVal fDegree As Single) As D2D1_MATRIX_4X4_F
+        Dim fAngleInRadian  As Single
+        Dim fMagnitude      As Single
+        Dim fSin            As Single
+        Dim fCos            As Single
+        Dim fInvCos         As Single
+
+        fMagnitude = D2D1Vec3Length(fX, fY, fZ)
+
+        fX = fX / fMagnitude
+        fY = fY / fMagnitude
+        fZ = fZ / fMagnitude
+
+        fAngleInRadian = fDegree * (3.141593! / 180!)
+
+        D2D1SinCos fAngleInRadian, fSin, fCos
+
+        fInvCos = 1 - fCos
+
+        With Matrix4x4F_RotationArbitraryAxis
+
+        .m_11 = 1 + fInvCos * (fX * fX - 1)
+        .m_12 = fZ * fSin + fInvCos * fX * fY
+        .m_13 = -fY * fSin + fInvCos * fX * fZ
+        .m_21 = -fZ * fSin + fInvCos * fY * fX
+        .m_22 = 1 + fInvCos * (fY * fY - 1)
+        .m_23 = fX * fSin + fInvCos * fY * fZ
+        .m_31 = fY * fSin + fInvCos * fZ * fX
+        .m_32 = -fX * fSin + fInvCos * fZ * fY
+        .m_33 = 1 + fInvCos * (fZ * fZ - 1)
+        .m_44 = 1
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_SkewX( _
+                    ByVal fDegreeX As Single) As D2D1_MATRIX_4X4_F
+        Dim fAngleInRadian  As Single
+        Dim fTan            As Single
+
+        fAngleInRadian = fDegreeX * (3.141593! / 180!)
+        fTan = D2D1Tan(fAngleInRadian)
+
+        With Matrix4x4F_SkewX
+
+        .m_11 = 1!
+        .m_21 = fTan
+        .m_22 = 1!
+        .m_33 = 1!
+        .m_44 = 1!
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_SkewY( _
+                    ByVal fDegreeY As Single) As D2D1_MATRIX_4X4_F
+        Dim fAngleInRadian  As Single
+        Dim fTan            As Single
+
+        fAngleInRadian = fDegreeY * (3.141593! / 180!)
+        fTan = D2D1Tan(fAngleInRadian)
+
+        With Matrix4x4F_SkewY
+
+        .m_11 = 1!
+        .m_12 = fTan
+        .m_22 = 1!
+        .m_33 = 1!
+        .m_44 = 1!
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_PerspectiveProjection( _
+                    ByVal fDepth As Single) As D2D1_MATRIX_4X4_F
+        Dim fProj   As Single
+
+        If fDepth > 0 Then
+            fProj = -1 / fDepth
+        End If
+
+        With Matrix4x4F_PerspectiveProjection
+
+        .m_11 = 1!
+        .m_12 = 1!
+        .m_22 = 1!
+        .m_33 = 1!
+        .m_34 = fProj
+        .m_44 = 1!
+
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_Determinant( _
+                    ByRef tMtx As D2D1_MATRIX_4X4_F) As Single
+        Dim fMinor1 As Single
+        Dim fMinor2 As Single
+        Dim fMinor3 As Single
+        Dim fMinor4 As Single
+
+        With tMtx
+
+        fMinor1 = .m_41 * (.m_12 * (.m_23 * .m_34 - .m_33 * .m_24) - _
+                    .m_13 * (.m_22 * .m_34 - .m_24 * .m_32) + _
+                    .m_14 * (.m_22 * .m_33 - .m_23 * .m_32))
+        fMinor2 = .m_42 * (.m_11 * (.m_21 * .m_34 - .m_31 * .m_24) - _
+                    .m_13 * (.m_21 * .m_34 - .m_24 * .m_31) + _
+                    .m_14 * (.m_21 * .m_33 - .m_23 * .m_31))
+        fMinor3 = .m_43 * (.m_11 * (.m_22 * .m_34 - .m_32 * .m_24) - _
+                    .m_12 * (.m_21 * .m_34 - .m_24 * .m_31) + _
+                    .m_14 * (.m_21 * .m_32 - .m_22 * .m_31))
+        fMinor4 = .m_44 * (.m_11 * (.m_22 * .m_33 - .m_32 * .m_23) - _
+                    .m_12 * (.m_21 * .m_33 - .m_23 * .m_31) + _
+                    .m_13 * (.m_21 * .m_32 - .m_22 * .m_31))
+
+        Matrix4x4F_Determinant = fMinor1 - fMinor2 + fMinor3 - fMinor4
+        
+        End With
+
+    End Function
+
+    Public Function Matrix4x4F_IsIdentity( _
+                    ByRef tMtx As D2D1_MATRIX_4X4_F) As Boolean
+        Matrix4x4F_IsIdentity = (tMtx.m_11 = 1!) And (tMtx.m_12 = 0!) And (tMtx.m_13 = 0!) And (tMtx.m_14 = 0!) And _
+                                (tMtx.m_21 = 0!) And (tMtx.m_22 = 1!) And (tMtx.m_23 = 0!) And (tMtx.m_24 = 0!) And _
+                                (tMtx.m_31 = 0!) And (tMtx.m_32 = 0!) And (tMtx.m_33 = 1!) And (tMtx.m_34 = 0!) And _
+                                (tMtx.m_41 = 0!) And (tMtx.m_42 = 0!) And (tMtx.m_43 = 1!) And (tMtx.m_44 = 1!)
+    End Function
+
+    Public Function Matrix4x4F_SetProduct( _
+                    ByRef tMtx1 As D2D1_MATRIX_4X4_F, _
+                    ByRef tMtx2 As D2D1_MATRIX_4X4_F) As D2D1_MATRIX_4X4_F
+            
+        With Matrix4x4F_SetProduct
+
+        .m_11 = tMtx1.m_11 * tMtx2.m_11 + tMtx1.m_12 * tMtx2.m_21 + tMtx1.m_13 * tMtx2.m_31 + tMtx1.m_14 * tMtx2.m_41
+        .m_12 = tMtx1.m_11 * tMtx2.m_12 + tMtx1.m_12 * tMtx2.m_22 + tMtx1.m_13 * tMtx2.m_32 + tMtx1.m_14 * tMtx2.m_42
+        .m_13 = tMtx1.m_11 * tMtx2.m_13 + tMtx1.m_12 * tMtx2.m_23 + tMtx1.m_13 * tMtx2.m_33 + tMtx1.m_14 * tMtx2.m_43
+        .m_14 = tMtx1.m_11 * tMtx2.m_14 + tMtx1.m_12 * tMtx2.m_24 + tMtx1.m_13 * tMtx2.m_34 + tMtx1.m_14 * tMtx2.m_44
+
+        .m_21 = tMtx1.m_21 * tMtx2.m_11 + tMtx1.m_22 * tMtx2.m_21 + tMtx1.m_23 * tMtx2.m_31 + tMtx1.m_24 * tMtx2.m_41
+        .m_22 = tMtx1.m_21 * tMtx2.m_12 + tMtx1.m_22 * tMtx2.m_22 + tMtx1.m_23 * tMtx2.m_32 + tMtx1.m_24 * tMtx2.m_42
+        .m_23 = tMtx1.m_21 * tMtx2.m_13 + tMtx1.m_22 * tMtx2.m_23 + tMtx1.m_23 * tMtx2.m_33 + tMtx1.m_24 * tMtx2.m_43
+        .m_24 = tMtx1.m_21 * tMtx2.m_14 + tMtx1.m_22 * tMtx2.m_24 + tMtx1.m_23 * tMtx2.m_34 + tMtx1.m_24 * tMtx2.m_44
+
+        .m_31 = tMtx1.m_31 * tMtx2.m_11 + tMtx1.m_32 * tMtx2.m_21 + tMtx1.m_33 * tMtx2.m_31 + tMtx1.m_34 * tMtx2.m_41
+        .m_32 = tMtx1.m_31 * tMtx2.m_12 + tMtx1.m_32 * tMtx2.m_22 + tMtx1.m_33 * tMtx2.m_32 + tMtx1.m_34 * tMtx2.m_42
+        .m_33 = tMtx1.m_31 * tMtx2.m_13 + tMtx1.m_32 * tMtx2.m_23 + tMtx1.m_33 * tMtx2.m_33 + tMtx1.m_34 * tMtx2.m_43
+        .m_34 = tMtx1.m_31 * tMtx2.m_14 + tMtx1.m_32 * tMtx2.m_24 + tMtx1.m_33 * tMtx2.m_34 + tMtx1.m_34 * tMtx2.m_44
+
+        .m_41 = tMtx1.m_41 * tMtx2.m_11 + tMtx1.m_42 * tMtx2.m_21 + tMtx1.m_43 * tMtx2.m_31 + tMtx1.m_44 * tMtx2.m_41
+        .m_42 = tMtx1.m_41 * tMtx2.m_12 + tMtx1.m_42 * tMtx2.m_22 + tMtx1.m_43 * tMtx2.m_32 + tMtx1.m_44 * tMtx2.m_42
+        .m_43 = tMtx1.m_41 * tMtx2.m_13 + tMtx1.m_42 * tMtx2.m_23 + tMtx1.m_43 * tMtx2.m_33 + tMtx1.m_44 * tMtx2.m_43
+        .m_44 = tMtx1.m_41 * tMtx2.m_14 + tMtx1.m_42 * tMtx2.m_24 + tMtx1.m_43 * tMtx2.m_34 + tMtx1.m_44 * tMtx2.m_44
+    
+        End With
+
+    End Function
+
+    Public Function Matrix5x4F( _
+                    ByVal f_11 As Single, _
+                    ByVal f_12 As Single, _
+                    ByVal f_13 As Single, _
+                    ByVal f_14 As Single, _
+                    ByVal f_21 As Single, _
+                    ByVal f_22 As Single, _
+                    ByVal f_23 As Single, _
+                    ByVal f_24 As Single, _
+                    ByVal f_31 As Single, _
+                    ByVal f_32 As Single, _
+                    ByVal f_33 As Single, _
+                    ByVal f_34 As Single, _
+                    ByVal f_41 As Single, _
+                    ByVal f_42 As Single, _
+                    ByVal f_43 As Single, _
+                    ByVal f_44 As Single, _
+                    ByVal f_51 As Single, _
+                    ByVal f_52 As Single, _
+                    ByVal f_53 As Single, _
+                    ByVal f_54 As Single) As D2D1_MATRIX_5X4_F
+
+        With Matrix5x4F
+
+        .m_11 = f_11
+        .m_12 = f_12
+        .m_13 = f_13
+        .m_14 = f_14
+        .m_21 = f_21
+        .m_22 = f_22
+        .m_23 = f_23
+        .m_24 = f_24
+        .m_31 = f_31
+        .m_32 = f_32
+        .m_33 = f_33
+        .m_34 = f_34
+        .m_41 = f_41
+        .m_42 = f_42
+        .m_43 = f_43
+        .m_44 = f_44
+        .m_51 = f_51
+        .m_52 = f_52
+        .m_53 = f_53
+        .m_54 = f_54
+
+        End With
+
+    End Function
+
+    Public Function Matrix5x4F_Identity() As D2D1_MATRIX_5X4_F
+
+        With Matrix5x4F_Identity
+
+        .m_11 = 1!
+        .m_22 = 1!
+        .m_33 = 1!
+        .m_44 = 1!
+
+        End With
+
+    End Function
+
+    Public Function ConvertColorSpace( _
+                    ByVal eSourceColorSpace As D2D1_COLOR_SPACE, _
+                    ByVal eDestinationColorSpace As D2D1_COLOR_SPACE, _
+                    ByRef tColor As D2D1_COLOR_F) As D2D1_COLOR_F
+        ConvertColorSpace = D2D1ConvertColorSpace(eSourceColorSpace, eDestinationColorSpace, tColor)
+    End Function
+
+    ' // TODO
+    ' // DrawingStateDescription1
+    ' // BitmapProperties1
+    ' // LayerParameters1
+    ' // StrokeStyleProperties1
+    ' // ImageBrushProperties
+    ' // BitmapBrushProperties1
+    ' // PrintControlProperties
+    ' // RenderingControls
+    ' // EffectInputDescription
+    ' // CreationProperties
+    ' // Point2L
+    ' // RectL
+
+    Public Sub SetDpiCompensatedEffectInput( _
+                ByVal cContext As ID2D1DeviceContext, _
+                ByVal cEffect As ID2D1Effect, _
+                ByVal lInputIndex As Long, _
+                ByVal cBitmap As ID2D1Bitmap, _
+                Optional ByVal eInterpolationMode As D2D1_INTERPOLATION_MODE = D2D1_INTERPOLATION_MODE_LINEAR, _
+                Optional ByVal eBorderMode As D2D1_BORDER_MODE = D2D1_BORDER_MODE_HARD)
+        Dim cDpiEffect  As ID2D1Effect
+        Dim tCLSID      As UUID
+        Dim tDPI        As D2D1_POINT_2F
+
+        If cBitmap Is Nothing Then
+            cEffect.SetInput lInputIndex, Nothing
+            Exit Sub
+        End If
+
+        ' // CLSID_D2D1DpiCompensation
+        ' GetMem8 511502141527783.9815@, tCLSID
+        ' GetMem8 294592394174280.438@, ByVal VarPtr(tCLSID) + 8
+
+        Set cDpiEffect = cContext.CreateEffect(CLSID_D2D1DpiCompensation)
+
+        cDpiEffect.SetInput 0, cBitmap
+        cBitmap.GetDpi tDPI.x, tDPI.y
+        cDpiEffect.SetValue D2D1_DPICOMPENSATION_PROP_INPUT_DPI, D2D1_PROPERTY_TYPE_UNKNOWN, tDPI, LenB(tDPI)
+        cDpiEffect.SetValue D2D1_DPICOMPENSATION_PROP_INTERPOLATION_MODE, D2D1_PROPERTY_TYPE_UNKNOWN, eInterpolationMode, LenB(eInterpolationMode)
+        cDpiEffect.SetValue D2D1_DPICOMPENSATION_PROP_BORDER_MODE, D2D1_PROPERTY_TYPE_UNKNOWN, eBorderMode, LenB(eBorderMode)
+        Dim di As ID2D1Image
+        cDpiEffect.GetOutput di
+        cEffect.SetInput lInputIndex, di
+
+    End Sub
+
+    Public Function SizeU(Optional ByVal cx As Long = 0, Optional ByVal cy As Long = 0) As D2D1_SIZE_U
+        SizeU.width = cx
+        SizeU.Height = cy
+    End Function
+    Public Function SizeF(Optional ByVal cx As Single = 0, Optional ByVal cy As Single = 0) As D2D1_SIZE_F
+        SizeF.width = cx
+        SizeF.Height = cy
+    End Function
+
+    Public Function Vector2F( _
+                    Optional ByVal fX As Single, _
+                    Optional ByVal fY As Single) As D2D1_VECTOR_2F
+
+        Vector2F.x = fX
+        Vector2F.y = fY
+
+    End Function
+
+    Public Function Vector3F( _
+                    Optional ByVal fX As Single, _
+                    Optional ByVal fY As Single, _
+                    Optional ByVal fZ As Single) As D2D1_VECTOR_3F
+
+        Vector3F.x = fX
+        Vector3F.y = fY
+        Vector3F.z = fZ
+
+    End Function
+
+    Public Function Vector4F( _
+                    Optional ByVal fX As Single, _
+                    Optional ByVal fY As Single, _
+                    Optional ByVal fZ As Single, _
+                    Optional ByVal fW As Single) As D2D1_VECTOR_4F
+
+        Vector4F.x = fX
+        Vector4F.y = fY
+        Vector4F.z = fZ
+        Vector4F.w = fW
+
+    End Function
+
+    Public Function RenderTargetProperties(Optional ByVal nType As D2D1_RENDER_TARGET_TYPE = D2D1_RENDER_TARGET_TYPE_DEFAULT, _
+                                Optional ByVal dxgiformat As DXGI_FORMAT = DXGI_FORMAT_UNKNOWN, _
+                                Optional ByVal AlphaMode As D2D1_ALPHA_MODE = D2D1_ALPHA_MODE_UNKNOWN, _
+                                Optional ByVal dpiX As Single = 0.0!, _
+                                Optional ByVal dpiY As Single = 0.0!, _
+                                Optional ByVal usage As D2D1_RENDER_TARGET_USAGE = D2D1_RENDER_TARGET_USAGE_NONE, _
+                                Optional ByVal minLevel As D2D1_FEATURE_LEVEL = D2D1_FEATURE_LEVEL_DEFAULT) As D2D1_RENDER_TARGET_PROPERTIES
+        With RenderTargetProperties
+            .type = nType
+            .PixelFormat = D2D1.PixelFormat(dxgiformat, AlphaMode)
+            .DpiX = dpiX
+            .DpiY = dpiY
+            .Usage = usage
+            .minLevel = minLevel
+        End With
+    End Function
+    Public Function PixelFormat(Optional ByVal dxgiformat As DXGI_FORMAT = DXGI_FORMAT_UNKNOWN, _
+                                Optional ByVal AlphaMode As D2D1_ALPHA_MODE = D2D1_ALPHA_MODE_UNKNOWN) As D2D1_PIXEL_FORMAT
+        PixelFormat.Format = dxgiformat
+        PixelFormat.AlphaMode = AlphaMode
+    End Function
+End Class

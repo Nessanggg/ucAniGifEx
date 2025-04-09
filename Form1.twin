@@ -1,0 +1,29 @@
+[Description("")]
+[FormDesignerId("CCD8F9CF-555E-4190-9DC5-C79962A3DECD")]
+[PredeclaredId]
+Class Form1
+
+    Private Sub Command1_Click() Handles Command1.Click
+        ' ucAniGifEx1.SizeToFit = True
+        ucAniGifEx1.BackColor = Me.BackColor
+        ucAniGifEx1.DisplayGifFromResource("104", "CUSTOM")
+    End Sub
+    
+    Private Sub File1_DblClick() Handles File1.DblClick
+        ' ucAniGifEx1.SizeToFit = True
+        ' ucAniGifEx1.BackColor = Me.BackColor
+        Debug.Print "Load " & File1.Path & File1.List(File1.ListIndex)
+        ucAniGifEx1.DisplayGifFromFile(File1.Path & File1.List(File1.ListIndex))
+    End Sub
+    
+    Private Sub Command2_Click() Handles Command2.Click
+        ucAniGifEx1.Paused = Not ucAniGifEx1.Paused
+    End Sub
+    
+    Private Sub Command3_Click() Handles Command3.Click
+        ucAniGifEx1.StopPlayback()
+    End Sub
+    
+ 
+ 
+End Class
