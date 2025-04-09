@@ -1,4 +1,4 @@
-# ucAniGifEx v1.0
+# ucAniGifEx v1.0.1
 ucAniGifEx Animated Gif Control
 
 ![ss](https://github.com/user-attachments/assets/ad8fcf31-6807-4193-9550-4b00f8b19a91)
@@ -8,6 +8,9 @@ ucAniGifEx Animated Gif Control
 **AniGifEx.twinproj** - ActiveX control project to build .ocx versions for VB6/VBA/etc
 
 See [Releases](https://github.com/fafalone/ucAniGifEx/releases) for binaries.
+
+**PROJECT UPDATED:**
+(v1.0.1, 09 Apr 2025) Quick fix for various looping issues, see Readme below.
 
 ```
 /********************************************************************************
@@ -65,7 +68,13 @@ See [Releases](https://github.com/fafalone/ucAniGifEx/releases) for binaries.
       twinBASIC currently displays a continuable exception error in the IDE. This
       does not seem to be impacting the control. A bug report has been filed.
       
-    Change log: 
+    Change log:
+      (09 Apr 2025, v1.0.1)
+          -To match modern browsers, gifs without looping info will only play once.
+          -Bug fix: Loop control override not properly implemented.
+          -Bug fix: Missing ByVals in loop metadata lookup caused all gifs to loop 
+                infinitely; could possibly cause crash.
+       
       (08 Apr 2025, v1.0) - Initial release.
       
     Thanks
