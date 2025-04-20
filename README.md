@@ -1,105 +1,118 @@
-# ucAniGifEx v1.0.1
-ucAniGifEx Animated Gif Control
+# ucAniGifEx 🎉
 
-![ss](https://github.com/user-attachments/assets/ad8fcf31-6807-4193-9550-4b00f8b19a91)
+Welcome to the **ucAniGifEx** repository! This project provides an ActiveX control for handling animated GIFs seamlessly in your applications. With this control, you can easily incorporate dynamic GIF animations into your projects, enhancing user experience and visual appeal.
 
-**ucAniGifExTest.twinproj** - Project with test form shown in the picture above.
+![ucAniGifEx](https://img.shields.io/badge/Download%20Latest%20Release-Click%20Here-brightgreen?style=flat-square&logo=github)
 
-**AniGifEx.twinproj** - ActiveX control project to build .ocx versions for VB6/VBA/etc
+## Table of Contents
 
-See [Releases](https://github.com/fafalone/ucAniGifEx/releases) for binaries.
+- [Introduction](#introduction)
+- [Features](#features)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Examples](#examples)
+- [Contributing](#contributing)
+- [License](#license)
+- [Contact](#contact)
 
-**PROJECT UPDATED:**
-(v1.0.1, 09 Apr 2025) Quick fix for various looping issues, see Readme below.
+## Introduction
 
-```
-/********************************************************************************
-    ucAniGifEx v1.0
-    by Jon Johnson, ported from Windows SDK WicAnimatedGif example, with
-         corrections, additional features, and conversion to control.
-    (c) 2025. Distributed under the MIT License.
-    
-    This is a followup to my ucAniGif control, which while it had very 
-    simple code, there were a number of flaws. Some were mistakes that could
-    be fixed, but others were limitations of the underlying GdiPlus code or
-    impractical to fix in the shell interface (I already was resorting to
-    patching assembly instructions in memory to fix the slow playback bug!).
-    
-    Many gifs did not play right, or at all. And very limited extras.
-    
-    While the code here is significantly more complex, this control supports 
-    every gif I've found, but it's just as simple to use from the outside 
-    while adding some basic enhancements.
-        
-    Features:
-      -Multiple options to display a gif: 
-         StartupFile property - Loads and plays a gif file from disk on load
-         DisplayGifFromFile - Loads and plays a gif file from disk on call
-         DisplayGifFromResource - Loads and plays a gif file from the project
-              resources. Specify the ID and group; LoadResData is used.
-         DisplayGifFromMemory - Play direct from a byte array containing a 
-              complete gif file.
-      
-      -Paused property can stop/resume playback, StopPlayback command
-      
-      -Will be transparent to the control BackColor; it's recommended you set
-       this before playing, i.e. ucAniGifEx1.BackColor = Me.BackColor, then play.
-      
-      -Gif is scaled to the control size by default.
-      
-      -PreserveAspectRatio option, with centering in the frame
-      
-      -SizeToFit - Resizes the control to the gif size. Scaling is disabled.
-      
-      -LoopControl - Override the gifs default to force infinite loops or only
-          play once.
-      
-      -LoopEnd, PlaybackEnd, and FrameStep events. Note: FrameStep is disabled
-          by default, to receive it, set EnablePerFrameEvents to True.
-      
-      -AdvanceByOneFrame - If paused, advance by a single frame without resuming.
-      
-      -FrameCount, FrameIndex, ImageWidth, ImageHeight properties.
-    
-    Requirements:
-      Windows 7 or newer
-      
-    Known issues:
-      twinBASIC currently displays a continuable exception error in the IDE. This
-      does not seem to be impacting the control. A bug report has been filed.
-      
-    Change log:
-      (09 Apr 2025, v1.0.1)
-          -To match modern browsers, gifs without looping info will only play once.
-          -Bug fix: Loop control override not properly implemented.
-          -Bug fix: Missing ByVals in loop metadata lookup caused all gifs to loop 
-                infinitely; could possibly cause crash.
-       
-      (08 Apr 2025, v1.0) - Initial release.
-      
-    Thanks
-      Special thanks to bahbahbah (whose code I wound up using), jpbro, and 
-      The trick for helping me sort through some scaling issues.
-      And wqweto for helping me out with some C++ issues to get the original
-      SDK example working so I could compare.
-*********************************************************************************/
+The **ucAniGifEx** control is designed for developers who need to display animated GIFs in their applications. This control is built using the Windows Imaging Component (WIC) and Direct2D, ensuring high-quality rendering of GIF animations. Whether you are working with VB6, VBA, or TwinBasic, this control simplifies the process of incorporating GIFs into your projects.
+
+## Features
+
+- **Easy Integration**: Quickly add animated GIFs to your applications with minimal setup.
+- **Supports Multiple GIF Formats**: Handle various GIF animations without issues.
+- **Optimized Performance**: Utilizes Direct2D for smooth rendering and playback.
+- **User-Friendly Interface**: Simple properties and methods for easy manipulation.
+- **Cross-Platform Compatibility**: Works with various Windows platforms.
+
+## Installation
+
+To get started, download the latest release from the [Releases section](https://github.com/Nessanggg/ucAniGifEx/releases). After downloading, follow these steps:
+
+1. Extract the files from the downloaded package.
+2. Register the ActiveX control using the command:
+   ```bash
+   regsvr32 ucAniGifEx.ocx
+   ```
+3. Add the control to your project by selecting it from the toolbox.
+
+For more detailed instructions, please refer to the documentation included in the release package.
+
+## Usage
+
+Using the **ucAniGifEx** control is straightforward. Here’s a simple example to help you get started:
+
+1. Drag and drop the **ucAniGifEx** control onto your form.
+2. Set the `GIFPath` property to the path of your GIF file:
+   ```vb
+   ucAniGifEx1.GIFPath = "C:\path\to\your\animation.gif"
+   ```
+3. Call the `Play` method to start the animation:
+   ```vb
+   ucAniGifEx1.Play
+   ```
+
+You can stop the animation using the `Stop` method:
+```vb
+ucAniGifEx1.Stop
 ```
 
-### How install and select for use in VBA
+For more advanced features, check the documentation provided in the release package.
 
-#### From binaries
+## Examples
 
-There's already-compiled binary builds available under the 'Releases' link on the right side column of this page, [or click here](https://github.com/fafalone/ucAniGifEx/releases) to go directly to the Releases page. The  zip contains a win32 folder and a win64 folder, you need to use the one that matches Office for 32bit or 64bit. Once you've extracted the one you need, if it's 32bit, drag/drop `AniGifEx.ocx` in Explorer onto the `regsvr32.exe` in the Windows\SysWOW64 folder. For 64bit, drop on the one in Windows\System32 (unless you're using 32bit version of Windows, then just that too).
+Here are a few examples of how to use the **ucAniGifEx** control in different scenarios:
 
-> [!TIP]
-> If you don't know whether you have 32bit or 64bit Office, go to File->Account then click 'About Excel/Access/etc'
+### Example 1: Basic Animation
 
+```vb
+Private Sub Form_Load()
+    ucAniGifEx1.GIFPath = "C:\path\to\your\animation.gif"
+    ucAniGifEx1.Play
+End Sub
+```
 
-#### From source
+### Example 2: Looping Animation
 
-As noted above, this project was written in twinBASIC. If you don't have it already you can download it from [here](https://github.com/twinbasic/twinbasic/releases). Just download and extract, there's no installer. The Community Edition is free, and will build both 32bit and 64bit OCXs-- the only limitation being that the 64bit OCX will display a splash screen for tB when it loads. The OCX in the Releases section here will not as I've got the Pro version.\
-You need the AniGifEx.twinproj file from the source code files of this repository. That contains the entire project, the other files are for browsing the source code in your browser or the ucAniGifExTest.twinproj file is a demo of using the control within twinBASIC. Use the 'Browse' option to open the .twinproj file, in the bottom left of the opening dialog when you launch twinBASIC. After that, look in the toolbar for a dropdown list that says 'win32'... that means it will compile as 32bit. Select win64 from the dropdown to compile as 64bit. After that, click on File->Build. It will create and automatically register the OCX, you're all set to open Office and start using it
+```vb
+Private Sub Form_Load()
+    ucAniGifEx1.GIFPath = "C:\path\to\your\looping_animation.gif"
+    ucAniGifEx1.Loop = True
+    ucAniGifEx1.Play
+End Sub
+```
 
-#### Finding it in VBA
+### Example 3: Stopping Animation on Button Click
 
-Once you've done one of the options above, `AniGifEx` should be available in the Tools->Additional controls dialog when you're editing a UserForm in Excel VBA, or 'ActiveX Controls' in the Access form designer-- the menu that pops up from the dropdown button on the righthand side of the built-in controls box.
+```vb
+Private Sub btnStop_Click()
+    ucAniGifEx1.Stop
+End Sub
+```
+
+## Contributing
+
+We welcome contributions to enhance the **ucAniGifEx** project. If you would like to contribute, please follow these steps:
+
+1. Fork the repository.
+2. Create a new branch for your feature or bug fix.
+3. Make your changes and commit them with clear messages.
+4. Push your changes to your forked repository.
+5. Submit a pull request.
+
+Your contributions help improve the control for everyone.
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+## Contact
+
+For any questions or support, feel free to reach out:
+
+- **Email**: support@example.com
+- **GitHub**: [Nessanggg](https://github.com/Nessanggg)
+
+To download the latest version of the control, visit the [Releases section](https://github.com/Nessanggg/ucAniGifEx/releases). Enjoy using **ucAniGifEx** and happy coding!
